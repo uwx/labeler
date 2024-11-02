@@ -104,15 +104,37 @@ export class LabelerServer {
 			);
 		`);
 
-		this.app = fastify();
+		this.app = fastify({
+			logger: {
+				level: 'trace'
+			}
+		});
 		void this.app.register(fastifyWebsocket).then(() => {
 			this.app.get("/xrpc/com.atproto.label.queryLabels", this.queryLabelsHandler);
 			this.app.post("/xrpc/tools.ozone.moderation.emitEvent", this.emitEventHandler);
+			//this.app.route({
+			//	method: 'GET',
+			//	url: "/xrpc/com.atproto.label.subscribeLabels",
+			//	handler: async (req, reply) => {
+			//		const url = new URL(req.url);
+			//		url.hostname = 'iqdb-ws.nothingeverhappen.com';
+			//		await reply.redirect(url.toString());
+			//	},
+			//	wsHandler: this.subscribeLabelsHandler
+			//});
 			this.app.get(
 				"/xrpc/com.atproto.label.subscribeLabels",
 				{ websocket: true },
 				this.subscribeLabelsHandler,
 			);
+			this.app.get("/xrpc/_health", async (req, res) => {
+				await res.send(
+					{
+						version: '0.1.13',
+						connections: this.connections.size,
+					},
+				);
+			});
 			this.app.get("/xrpc/*", this.unknownMethodHandler);
 			this.app.setErrorHandler(this.errorHandler);
 		});
@@ -334,6 +356,7 @@ export class LabelerServer {
 	 * Handler for [com.atproto.label.subscribeLabels](https://github.com/bluesky-social/atproto/blob/main/lexicons/com/atproto/label/subscribeLabels.json).
 	 */
 	subscribeLabelsHandler: SubscriptionHandler<{ cursor?: string }> = (ws, req) => {
+		console.log(`connected via ws`);
 		const cursor = parseInt(req.query.cursor ?? "NaN", 10);
 
 		if (!Number.isNaN(cursor)) {
@@ -341,6 +364,7 @@ export class LabelerServer {
 				SELECT MAX(id) AS id FROM labels
 			`).get() as { id: number };
 			if (cursor > (latest.id ?? 0)) {
+				console.log(`sending FutureCursor to ws`);
 				const errorBytes = frameToBytes("error", {
 					error: "FutureCursor",
 					message: "Cursor is in the future",
@@ -357,6 +381,7 @@ export class LabelerServer {
 
 			try {
 				for (const row of stmt.iterate(cursor)) {
+					console.log(`sending ${row} to ws`);
 					const { id: seq, ...label } = row as SavedLabel;
 					const bytes = frameToBytes(
 						"message",
@@ -379,6 +404,7 @@ export class LabelerServer {
 		this.addSubscription("com.atproto.label.subscribeLabels", ws);
 
 		ws.on("close", () => {
+			console.log(`ws closed!!!`);
 			this.removeSubscription("com.atproto.label.subscribeLabels", ws);
 		});
 	};
