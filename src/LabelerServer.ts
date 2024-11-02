@@ -6,7 +6,7 @@ import type {
 	ToolsOzoneModerationEmitEvent,
 } from "@atcute/client/lexicons";
 import { fastifyWebsocket } from "@fastify/websocket";
-import fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
+import fastify, { FastifyBaseLogger, type FastifyInstance, type FastifyRequest } from "fastify";
 import Database, { type Database as SQLiteDatabase } from "libsql";
 import type { WebSocket } from "ws";
 import { parsePrivateKey, verifyJwt } from "./util/crypto.js";
@@ -51,6 +51,8 @@ export interface LabelerOptions {
 	 * @default labels.db
 	 */
 	dbPath?: string;
+
+	logger?: FastifyBaseLogger;
 }
 
 export class LabelerServer {
@@ -70,7 +72,7 @@ export class LabelerServer {
 	private connections = new Map<string, Set<WebSocket>>();
 
 	/** The signing key used for the labeler. */
-	#signingKey: Uint8Array;
+	private signingKey: Uint8Array;
 
 	/**
 	 * Create a labeler server.
@@ -82,8 +84,8 @@ export class LabelerServer {
 
 		try {
 			if (options.signingKey.startsWith("did:key:")) throw 0;
-			this.#signingKey = parsePrivateKey(options.signingKey);
-			if (this.#signingKey.byteLength !== 32) throw 0;
+			this.signingKey = parsePrivateKey(options.signingKey);
+			if (this.signingKey.byteLength !== 32) throw 0;
 		} catch {
 			throw new Error(INVALID_SIGNING_KEY_ERROR);
 		}
@@ -105,7 +107,7 @@ export class LabelerServer {
 		`);
 
 		this.app = fastify({
-			logger: {
+			logger: options.logger ?? {
 				level: 'trace'
 			}
 		});
@@ -140,6 +142,10 @@ export class LabelerServer {
 		});
 	}
 
+	private get logger() {
+		return this.app.log;
+	}
+
 	/**
 	 * Start the server.
 	 * @param port The port to listen on.
@@ -171,7 +177,7 @@ export class LabelerServer {
 	 * @returns The inserted label.
 	 */
 	private saveLabel(label: UnsignedLabel): SavedLabel {
-		const signed = labelIsSigned(label) ? label : signLabel(label, this.#signingKey);
+		const signed = labelIsSigned(label) ? label : signLabel(label, this.signingKey);
 
 		const stmt = this.db.prepare(`
 			INSERT INTO labels (src, uri, cid, val, neg, cts, exp, sig)
@@ -356,7 +362,7 @@ export class LabelerServer {
 	 * Handler for [com.atproto.label.subscribeLabels](https://github.com/bluesky-social/atproto/blob/main/lexicons/com/atproto/label/subscribeLabels.json).
 	 */
 	subscribeLabelsHandler: SubscriptionHandler<{ cursor?: string }> = (ws, req) => {
-		console.log(`connected via ws`);
+		this.logger.trace(`connected via ws`);
 		const cursor = parseInt(req.query.cursor ?? "NaN", 10);
 
 		if (!Number.isNaN(cursor)) {
@@ -364,7 +370,7 @@ export class LabelerServer {
 				SELECT MAX(id) AS id FROM labels
 			`).get() as { id: number };
 			if (cursor > (latest.id ?? 0)) {
-				console.log(`sending FutureCursor to ws`);
+				this.logger.trace(`sending FutureCursor to ws`);
 				const errorBytes = frameToBytes("error", {
 					error: "FutureCursor",
 					message: "Cursor is in the future",
@@ -381,7 +387,7 @@ export class LabelerServer {
 
 			try {
 				for (const row of stmt.iterate(cursor)) {
-					console.log(`sending ${row} to ws`);
+					this.logger.trace(`sending ${row} to ws`);
 					const { id: seq, ...label } = row as SavedLabel;
 					const bytes = frameToBytes(
 						"message",
@@ -391,7 +397,7 @@ export class LabelerServer {
 					ws.send(bytes);
 				}
 			} catch (e) {
-				console.error(e);
+				this.logger.error(e);
 				const errorBytes = frameToBytes("error", {
 					error: "InternalServerError",
 					message: "An unknown error occurred",
@@ -404,7 +410,7 @@ export class LabelerServer {
 		this.addSubscription("com.atproto.label.subscribeLabels", ws);
 
 		ws.on("close", () => {
-			console.log(`ws closed!!!`);
+			this.logger.trace(`ws closed!!!`);
 			this.removeSubscription("com.atproto.label.subscribeLabels", ws);
 		});
 	};
