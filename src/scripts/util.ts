@@ -9,6 +9,9 @@ export interface LoginCredentials {
 	password: string;
 	/** The 2FA code, if 2FA is enabled. */
 	code?: string;
+
+	/** The credential manager to use. */
+	credentialManager?: CredentialManager;
 }
 
 let xrpc: XRPC | undefined;
@@ -17,7 +20,7 @@ let credentialManager: CredentialManager | undefined;
 export async function loginAgent(
 	{ pds, ...credentials }: LoginCredentials,
 ): Promise<{ agent: XRPC; session: AtpSessionData }> {
-	credentialManager ??= new CredentialManager({ service: pds || "https://bsky.social" });
+	credentialManager ??= credentials.credentialManager ?? new CredentialManager({ service: pds || "https://bsky.social" });
 	xrpc ??= new XRPC({ handler: credentialManager });
 
 	if (
