@@ -5,23 +5,20 @@ import type {
 	ComAtprotoLabelQueryLabels,
 	ToolsOzoneModerationEmitEvent,
 } from "@atcute/client/lexicons";
-// import { fastifyWebsocket } from "@fastify/websocket";
-import { FastifyReply, type FastifyInstance, type FastifyRequest, type FastifyListenOptions } from "fastify";
-import type { WebSocket } from "ws";
+import type { FastifyBaseLogger } from "fastify";
 import { parsePrivateKey, verifyJwt } from "./util/crypto.js";
 import { formatLabel, labelIsSigned, signLabel } from "./util/labels.js";
 import type {
 	CreateLabelData,
-	ProcedureHandler,
-	QueryHandler,
 	SavedLabel,
 	SignedLabel,
-	SubscriptionHandler,
 	UnsignedLabel,
 } from "./util/types.js";
 import { excludeNullish, frameToBytes } from "./util/util.js";
-import fastifyPlugin from 'fastify-plugin';
 import { DbProvider, DefaultDbProvider } from "./db-provider.js";
+import { Context, Hono, HonoRequest } from 'hono';
+import { NodeWebSocket } from '@hono/node-ws';
+import { WSContext, WSEvents } from "hono/ws";
 
 const INVALID_SIGNING_KEY_ERROR = `Make sure to provide a private signing key, not a public key.
 
@@ -57,33 +54,9 @@ export interface LabelerOptions {
 	db?: DbProvider;
 }
 
-export const labelerServerKey = Symbol('LabelerServer');
-
-declare module 'fastify' {
-	interface FastifyInstance {
-		[labelerServerKey]: LabelerServer;
-	}
-}
-
-export default fastifyPlugin((app, options: LabelerOptions, done) => {
-	const instance = new LabelerServer(app, options);
-	app.decorate(labelerServerKey, instance);
-	// await app.register(fastifyWebsocket);
-	app.get("/xrpc/com.atproto.label.queryLabels", instance.queryLabelsHandler);
-	app.post("/xrpc/tools.ozone.moderation.emitEvent", instance.emitEventHandler);
-	app.get(
-		"/xrpc/com.atproto.label.subscribeLabels",
-		{ websocket: true },
-		instance.subscribeLabelsHandler,
-	);
-	app.get("/xrpc/_health", instance.healthHandler);
-
-	done();
-});
-
 export class LabelerServer {
 	/** The Fastify application instance. */
-	app: FastifyInstance;
+	app: Hono;
 
 	db: DbProvider;
 
@@ -94,23 +67,17 @@ export class LabelerServer {
 	private auth: (did: string) => boolean | Promise<boolean>;
 
 	/** Open WebSocket connections, mapped by request NSID. */
-	private connections = new Map<string, Set<WebSocket>>();
+	private connections = new Map<string, Set<WSContext>>();
 
 	/** The signing key used for the labeler. */
 	private signingKey: Uint8Array;
-
-	/**
-	 * Promise that resolves when database initialization is complete.
-	 * This should be awaited before any database operations.
-	 */
-	private readonly dbInitLock?: Promise<void>;
 
 	/**
 	 * Create a labeler server.
 	 * @param options Configuration options.
 	 * @private
 	 */
-	constructor(app: FastifyInstance, options: LabelerOptions) {
+	constructor(app: Hono, upgradeWebSocket: NodeWebSocket['upgradeWebSocket'], options: LabelerOptions, private readonly logger: FastifyBaseLogger) {
 		this.did = options.did as At.DID;
 		this.auth = options.auth ?? ((did) => did === this.did);
 
@@ -125,54 +92,16 @@ export class LabelerServer {
 		this.db = options.db ?? new DefaultDbProvider(options.dbPath);
 
 		this.app = app;
+        
+        app.get("/xrpc/com.atproto.label.queryLabels", this.queryLabelsHandler);
+        app.post("/xrpc/tools.ozone.moderation.emitEvent", this.emitEventHandler);
+        app.get(
+            "/xrpc/com.atproto.label.subscribeLabels",
+            upgradeWebSocket(this.subscribeLabelsHandler)
+        );
+        app.get("/xrpc/_health", this.healthHandler);
 	}
-
-	private get logger() {
-		return this.app.log;
-	}
-
-	/**
-	 * Start the server.
-	 * @param port The port to listen on.
-	 * @param callback A callback to run when the server is started.
-	 */
-	start(port: number, callback: (error: Error | null, address: string) => void): void;
-	/**
-	 * Start the server.
-	 * @param options Options for the server.
-	 * @param callback A callback to run when the server is started.
-	 */
-	start(
-		options: FastifyListenOptions,
-		callback: (error: Error | null, address: string) => void,
-	): void;
-	start(
-		portOrOptions: number | FastifyListenOptions,
-		callback: (error: Error | null, address: string) => void = () => {},
-	) {
-		if (typeof portOrOptions === "number") {
-			this.app.listen({ port: portOrOptions }, callback);
-		} else {
-			this.app.listen(portOrOptions, callback);
-		}
-	}
-
-	/**
-	 * Stop the server.
-	 * @param callback A callback to run when the server is stopped.
-	 */
-	close(callback: () => void = () => {}) {
-		this.app.close(callback);
-	}
-
-	/**
-	 * Alias for {@link LabelerServer#close}.
-	 * @param callback A callback to run when the server is stopped.
-	 */
-	stop(callback: () => void = () => {}) {
-		this.close(callback);
-	}
-
+    
 	async queryLabels(identifier: string, cursor = 0, limit = 1): Promise<SavedLabel[]> {
 		return await this.db.queryLabels(identifier, cursor, limit);
 	}
@@ -216,8 +145,6 @@ export class LabelerServer {
 		subject: { uri: string; cid?: string | undefined },
 		labels: { create?: string[]; negate?: string[] },
 	): Promise<SavedLabel[]> {
-		await this.dbInitLock;
-
 		const { uri, cid } = subject;
 		const { create, negate } = labels;
 
@@ -253,8 +180,8 @@ export class LabelerServer {
 	 * Parse a user DID from an Authorization header JWT.
 	 * @param req The Express request object.
 	 */
-	private async parseAuthHeaderDid(req: FastifyRequest): Promise<string> {
-		const authHeader = req.headers.authorization;
+	private async parseAuthHeaderDid(req: HonoRequest): Promise<string> {
+		const authHeader = req.header('authorization');
 		if (!authHeader) {
 			throw new XRPCError(401, {
 				kind: "AuthRequired",
@@ -270,7 +197,7 @@ export class LabelerServer {
 			});
 		}
 
-		const nsid = (req.originalUrl || req.url || "").split("?")[0].replace("/xrpc/", "").replace(
+		const nsid = (req.url || "").split("?")[0].replace("/xrpc/", "").replace(
 			/\/$/,
 			"",
 		);
@@ -280,31 +207,71 @@ export class LabelerServer {
 		return payload.iss;
 	}
 
+    subscribeLabelsHandler = (c: Context): WSEvents => {
+        const cursor = parseInt(c.req.query('cursor') ?? 'NaN', 10);
+
+        return {
+            onOpen: async (evt, ws) => {
+                // catch up:
+                if (cursor !== undefined) {
+
+                    if (await this.db.isCursorInTheFuture(cursor)) {
+                        this.logger.warn(`sending FutureCursor to ws`);
+
+                        const errorBytes = frameToBytes("error", {
+                            error: "FutureCursor",
+                            message: "Cursor is in the future",
+                        });
+                        ws.send(errorBytes);
+                        ws.close();
+                        return;
+                    }
+                        
+                    try {
+                        for await (const { id: seq, ...label } of this.db.iterateLabels(cursor)) {
+                            this.logger.debug(`sending label ${seq} (${label.val}) to ws`);
+
+                            const bytes = frameToBytes(
+                                "message",
+                                { seq, labels: [formatLabel(label)] },
+                                "#labels",
+                            );
+                            ws.send(bytes);
+                        }
+                    } catch (e) {
+                        this.logger.error(e);
+                        const errorBytes = frameToBytes("error", {
+                            error: "InternalServerError",
+                            message: "An unknown error occurred",
+                        });
+                        ws.send(errorBytes);
+                        ws.close();
+                        return;
+                    }
+                }
+
+                this.addSubscription("com.atproto.label.subscribeLabels", ws);
+                this.logger.info('added subscription');
+            },
+            onError: (evt) => {
+                this.logger.error(evt, `ws error`);
+            },
+            onClose: (evt, ws) => {
+                this.logger.debug(evt, `ws closed!!!`);
+                this.removeSubscription("com.atproto.label.subscribeLabels", ws);
+            },
+        } satisfies WSEvents;
+    }
+
 	/**
 	 * Handler for [com.atproto.label.queryLabels](https://github.com/bluesky-social/atproto/blob/main/lexicons/com/atproto/label/queryLabels.json).
 	 */
-	queryLabelsHandler: QueryHandler<ComAtprotoLabelQueryLabels.Params> = async (req, res) => {
-		await this.dbInitLock;
+	queryLabelsHandler = async (c: Context) => {
+		const uriPatterns = c.req.queries('uriPatterns') || [];
 
-		let uriPatterns: Array<string>;
-		if (!req.query.uriPatterns) {
-			uriPatterns = [];
-		} else if (typeof req.query.uriPatterns === "string") {
-			uriPatterns = [req.query.uriPatterns];
-		} else {
-			uriPatterns = req.query.uriPatterns || [];
-		}
+		const sources = c.req.queries('sources') || [];
 
-		let sources: Array<string>;
-		if (!req.query.sources) {
-			sources = [];
-		} else if (typeof req.query.sources === "string") {
-			sources = [req.query.sources];
-		} else {
-			sources = req.query.sources || [];
-		}
-
-		const cursor = parseInt(req.query.cursor ?? '0', 10);
+		const cursor = parseInt(c.req.query('cursor') ?? '0', 10);
 		if (cursor !== undefined && Number.isNaN(cursor)) {
 			throw new XRPCError(400, {
 				kind: "InvalidRequest",
@@ -312,7 +279,7 @@ export class LabelerServer {
 			});
 		}
 
-		const limit = parseInt(`${req.query.limit || 50}`, 10);
+		const limit = parseInt(`${c.req.query('limit') || 50}`, 10);
 		if (Number.isNaN(limit) || limit < 1 || limit > 250) {
 			throw new XRPCError(400, {
 				kind: "InvalidRequest",
@@ -326,73 +293,20 @@ export class LabelerServer {
 
 		const nextCursor = rows[rows.length - 1]?.id?.toString(10) || "0";
 
-		await res.send({ cursor: nextCursor, labels } satisfies ComAtprotoLabelQueryLabels.Output);
-	};
-
-	/**
-	 * Handler for [com.atproto.label.subscribeLabels](https://github.com/bluesky-social/atproto/blob/main/lexicons/com/atproto/label/subscribeLabels.json).
-	 */
-	subscribeLabelsHandler: SubscriptionHandler<{ cursor?: string }> = async (ws, req) => {
-		this.logger.debug(`connected via ws`);
-		const cursor = parseInt(req.query.cursor ?? 'NaN', 10);
-
-		if (cursor !== undefined) {
-			if (await this.db.isCursorInTheFuture(cursor)) {
-				this.logger.warn(`sending FutureCursor to ws`);
-
-				const errorBytes = frameToBytes("error", {
-					error: "FutureCursor",
-					message: "Cursor is in the future",
-				});
-				ws.send(errorBytes);
-				ws.terminate();
-			}
-
-			try {
-				for await (const { id: seq, ...label } of this.db.iterateLabels(cursor)) {
-					this.logger.debug(`sending label ${seq} (${label.val}) to ws`);
-
-					const bytes = frameToBytes(
-						"message",
-						{ seq, labels: [formatLabel(label)] },
-						"#labels",
-					);
-					ws.send(bytes);
-				}
-			} catch (e) {
-				this.logger.error(e);
-				const errorBytes = frameToBytes("error", {
-					error: "InternalServerError",
-					message: "An unknown error occurred",
-				});
-				ws.send(errorBytes);
-				ws.terminate();
-			}
-		}
-
-		this.addSubscription("com.atproto.label.subscribeLabels", ws);
-
-        ws.on('error', err => {
-            this.logger.error(err, `ws error`);
-        })
-
-		ws.on("close", (code, reason) => {
-			this.logger.debug({code, reason: reason.toString('utf-8') }, `ws closed!!!`);
-			this.removeSubscription("com.atproto.label.subscribeLabels", ws);
-		});
+		return c.json({ cursor: nextCursor, labels } satisfies ComAtprotoLabelQueryLabels.Output);
 	};
 
 	/**
 	 * Handler for [tools.ozone.moderation.emitEvent](https://github.com/bluesky-social/atproto/blob/main/lexicons/tools/ozone/moderation/emitEvent.json).
 	 */
-	emitEventHandler: ProcedureHandler<ToolsOzoneModerationEmitEvent.Input> = async (req, res) => {
-		const actorDid = await this.parseAuthHeaderDid(req);
+	emitEventHandler = async (c: Context) => {
+		const actorDid = await this.parseAuthHeaderDid(c.req);
 		const authed = await this.auth(actorDid);
 		if (!authed) {
 			throw new XRPCError(401, { kind: "AuthRequired", description: "Unauthorized" });
 		}
 
-		const { event, subject, subjectBlobCids = [], createdBy } = req.body;
+		const { event, subject, subjectBlobCids = [], createdBy } = await c.req.json();
 		if (!event || !subject || !createdBy) {
 			throw new XRPCError(400, {
 				kind: "InvalidRequest",
@@ -434,7 +348,7 @@ export class LabelerServer {
 			throw new Error(`No labels were created\nEvent:\n${JSON.stringify(event, null, 2)}`);
 		}
 
-		await res.send(
+		return c.json(
 			{
 				id: labels[0].id,
 				event,
@@ -449,38 +363,38 @@ export class LabelerServer {
 	/**
 	 * Handler for the health check endpoint.
 	 */
-	healthHandler: QueryHandler = async (_req, res) => {
+	healthHandler = (c: Context) => {
 		const VERSION = "0.2.0";
-		return res.send({ version: VERSION });
+		return c.json({ version: VERSION });
 	};
 
 	/**
 	 * Catch-all handler for unknown XRPC methods.
 	 */
-	unknownMethodHandler: QueryHandler = async (_req, res) =>
-		res.status(501).send({ error: "MethodNotImplemented", message: "Method Not Implemented" });
+	unknownMethodHandler = (c: Context) =>
+		c.json({ error: "MethodNotImplemented", message: "Method Not Implemented" }, 501);
 
 	/**
 	 * Default error handler.
 	 */
-	errorHandler: typeof this.app.errorHandler = async (err, _req, res) => {
-		if (err instanceof XRPCError) {
-			return res.status(err.status).send({ error: err.kind, message: err.description });
-		} else {
-			console.error(err);
-			return res.status(500).send({
-				error: "InternalServerError",
-				message: "An unknown error occurred",
-			});
-		}
-	};
+	// errorHandler: typeof this.app.errorHandler = async (err, _req, res) => {
+	// 	if (err instanceof XRPCError) {
+	// 		return res.status(err.status).send({ error: err.kind, message: err.description });
+	// 	} else {
+	// 		console.error(err);
+	// 		return res.status(500).send({
+	// 			error: "InternalServerError",
+	// 			message: "An unknown error occurred",
+	// 		});
+	// 	}
+	// };
 
 	/**
 	 * Add a WebSocket connection to the list of subscribers for a given lexicon.
 	 * @param nsid The NSID of the lexicon to subscribe to.
 	 * @param ws The WebSocket connection to add.
 	 */
-	private addSubscription(nsid: string, ws: WebSocket) {
+	private addSubscription(nsid: string, ws: WSContext) {
 		const subs = this.connections.get(nsid) ?? new Set();
 		subs.add(ws);
 		this.connections.set(nsid, subs);
@@ -491,7 +405,7 @@ export class LabelerServer {
 	 * @param nsid The NSID of the lexicon to unsubscribe from.
 	 * @param ws The WebSocket connection to remove.
 	 */
-	private removeSubscription(nsid: string, ws: WebSocket) {
+	private removeSubscription(nsid: string, ws: WSContext) {
 		const subs = this.connections.get(nsid);
 		if (subs) {
 			subs.delete(ws);
