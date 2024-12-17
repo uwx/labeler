@@ -333,7 +333,7 @@ export class LabelerServer {
 	 * Handler for [com.atproto.label.subscribeLabels](https://github.com/bluesky-social/atproto/blob/main/lexicons/com/atproto/label/subscribeLabels.json).
 	 */
 	subscribeLabelsHandler: SubscriptionHandler<{ cursor?: string }> = async (ws, req) => {
-		this.logger.trace(`connected via ws`);
+		this.logger.debug(`connected via ws`);
 		const cursor = parseInt(req.query.cursor ?? 'NaN', 10);
 
 		if (cursor !== undefined) {
@@ -350,7 +350,7 @@ export class LabelerServer {
 
 			try {
 				for await (const { id: seq, ...label } of this.db.iterateLabels(cursor)) {
-					this.logger.trace(label, `sending label ${seq} to ws`);
+					this.logger.debug(`sending label ${seq} (${label.val}) to ws`);
 
 					const bytes = frameToBytes(
 						"message",
@@ -372,8 +372,12 @@ export class LabelerServer {
 
 		this.addSubscription("com.atproto.label.subscribeLabels", ws);
 
-		ws.on("close", () => {
-			this.logger.trace(`ws closed!!!`);
+        ws.on('error', err => {
+            this.logger.error(err, `ws error`);
+        })
+
+		ws.on("close", (code, reason) => {
+			this.logger.debug({code, reason: reason.toString('utf-8') }, `ws closed!!!`);
 			this.removeSubscription("com.atproto.label.subscribeLabels", ws);
 		});
 	};
