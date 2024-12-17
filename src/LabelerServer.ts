@@ -302,7 +302,7 @@ export class LabelerServer {
 			});
 		}
 
-		const rows = this.db.searchLabels(cursor, limit, uriPatterns, sources);
+		const rows = await this.db.searchLabels(cursor, limit, uriPatterns, sources);
 
 		const labels = rows.map(formatLabel);
 
@@ -314,13 +314,13 @@ export class LabelerServer {
 	/**
 	 * Handler for [com.atproto.label.subscribeLabels](https://github.com/bluesky-social/atproto/blob/main/lexicons/com/atproto/label/subscribeLabels.json).
 	 */
-	subscribeLabelsHandler: SubscriptionHandler<{ cursor?: string }> = (ws, req) => {
+	subscribeLabelsHandler: SubscriptionHandler<{ cursor?: string }> = async (ws, req) => {
 		this.logger.trace(`connected via ws`);
 		const cursor = parseInt(req.query.cursor ?? 'NaN', 10);
 
 		if (cursor !== undefined) {
 			if (this.db.isCursorInTheFuture(cursor)) {
-				this.logger.trace(`sending FutureCursor to ws`);
+				this.logger.warn(`sending FutureCursor to ws`);
 				const errorBytes = frameToBytes("error", {
 					error: "FutureCursor",
 					message: "Cursor is in the future",
@@ -330,7 +330,7 @@ export class LabelerServer {
 			}
 
 			try {
-				for (const { id: seq, ...label } of this.db.iterateLabels(cursor)) {
+				for await (const { id: seq, ...label } of this.db.iterateLabels(cursor)) {
 					this.logger.trace(label, `sending label ${seq} to ws`);
 
 					const bytes = frameToBytes(
@@ -402,7 +402,7 @@ export class LabelerServer {
 			throw new XRPCError(400, { kind: "InvalidRequest", description: "Invalid subject" });
 		}
 
-		const labels = this.createLabels({ uri, cid }, {
+		const labels = await this.createLabels({ uri, cid }, {
 			create: event.createLabelVals,
 			negate: event.negateLabelVals,
 		});

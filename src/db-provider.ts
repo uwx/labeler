@@ -5,10 +5,10 @@ import { XRPCError } from "@atcute/client";
 export interface DbProvider {
     queryLabels(identifier: string, cursor?: number, limit?: number): Promise<SavedLabel[]> | SavedLabel[];
     saveLabel(label: SignedLabel): number | Promise<number>;
-    searchLabels(cursor?: number, limit?: number, uriPatterns?: string[], sources?: string[]): SavedLabel[];
+    searchLabels(cursor?: number, limit?: number, uriPatterns?: string[], sources?: string[]): Promise<SavedLabel[]> | SavedLabel[];
 
-    isCursorInTheFuture(cursor: number): boolean;
-    iterateLabels(cursor?: number): Iterable<SavedLabel>;
+    isCursorInTheFuture(cursor: number): boolean | Promise<boolean>;
+    iterateLabels(cursor?: number): Iterable<SavedLabel> | AsyncIterable<SavedLabel>;
 }
 
 /** @private */

@@ -1,7 +1,7 @@
 import { encode as cborEncode, toBytes } from "@atcute/cbor";
-import type { At } from "@atcute/client/lexicons";
+import type { At, ComAtprotoLabelDefs } from "@atcute/client/lexicons";
 import { k256Sign } from "./crypto.js";
-import type { FormattedLabel, SignedLabel, UnsignedLabel } from "./types.js";
+import type { SignedLabel, UnsignedLabel } from "./types.js";
 import { excludeNullish } from "./util.js";
 
 const LABEL_VERSION = 1;
@@ -12,7 +12,7 @@ function formatLabelCbor(label: UnsignedLabel): UnsignedLabel {
 
 export function formatLabel(
 	label: UnsignedLabel & { sig?: ArrayBuffer | Uint8Array | At.Bytes },
-): FormattedLabel {
+): ComAtprotoLabelDefs.Label {
 	const sig = label.sig instanceof ArrayBuffer
 		? toBytes(new Uint8Array(label.sig))
 		: label.sig instanceof Uint8Array
