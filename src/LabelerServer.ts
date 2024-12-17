@@ -6,7 +6,7 @@ import type {
 	ToolsOzoneModerationEmitEvent,
 } from "@atcute/client/lexicons";
 // import { fastifyWebsocket } from "@fastify/websocket";
-import { FastifyReply, type FastifyInstance, type FastifyRequest } from "fastify";
+import { FastifyReply, type FastifyInstance, type FastifyRequest, type FastifyListenOptions } from "fastify";
 import type { WebSocket } from "ws";
 import { parsePrivateKey, verifyJwt } from "./util/crypto.js";
 import { formatLabel, labelIsSigned, signLabel } from "./util/labels.js";
@@ -100,6 +100,12 @@ export class LabelerServer {
 	private signingKey: Uint8Array;
 
 	/**
+	 * Promise that resolves when database initialization is complete.
+	 * This should be awaited before any database operations.
+	 */
+	private readonly dbInitLock?: Promise<void>;
+
+	/**
 	 * Create a labeler server.
 	 * @param options Configuration options.
 	 * @private
@@ -130,8 +136,25 @@ export class LabelerServer {
 	 * @param port The port to listen on.
 	 * @param callback A callback to run when the server is started.
 	 */
-	start(port: number, callback: (error: Error | null, address: string) => void = () => {}) {
-		this.app.listen({ port }, callback);
+	start(port: number, callback: (error: Error | null, address: string) => void): void;
+	/**
+	 * Start the server.
+	 * @param options Options for the server.
+	 * @param callback A callback to run when the server is started.
+	 */
+	start(
+		options: FastifyListenOptions,
+		callback: (error: Error | null, address: string) => void,
+	): void;
+	start(
+		portOrOptions: number | FastifyListenOptions,
+		callback: (error: Error | null, address: string) => void = () => {},
+	) {
+		if (typeof portOrOptions === "number") {
+			this.app.listen({ port: portOrOptions }, callback);
+		} else {
+			this.app.listen(portOrOptions, callback);
+		}
 	}
 
 	/**
@@ -193,6 +216,8 @@ export class LabelerServer {
 		subject: { uri: string; cid?: string | undefined },
 		labels: { create?: string[]; negate?: string[] },
 	): Promise<SavedLabel[]> {
+		await this.dbInitLock;
+
 		const { uri, cid } = subject;
 		const { create, negate } = labels;
 
@@ -255,19 +280,12 @@ export class LabelerServer {
 		return payload.iss;
 	}
 
-	healthHandler = async (req: FastifyRequest, res: FastifyReply) => {
-		await res.send(
-			{
-				version: '0.1.13',
-				connections: this.connections.size,
-			},
-		);
-	};
-
 	/**
 	 * Handler for [com.atproto.label.queryLabels](https://github.com/bluesky-social/atproto/blob/main/lexicons/com/atproto/label/queryLabels.json).
 	 */
 	queryLabelsHandler: QueryHandler<ComAtprotoLabelQueryLabels.Params> = async (req, res) => {
+		await this.dbInitLock;
+
 		let uriPatterns: Array<string>;
 		if (!req.query.uriPatterns) {
 			uriPatterns = [];
@@ -319,8 +337,9 @@ export class LabelerServer {
 		const cursor = parseInt(req.query.cursor ?? 'NaN', 10);
 
 		if (cursor !== undefined) {
-			if (this.db.isCursorInTheFuture(cursor)) {
+			if (await this.db.isCursorInTheFuture(cursor)) {
 				this.logger.warn(`sending FutureCursor to ws`);
+
 				const errorBytes = frameToBytes("error", {
 					error: "FutureCursor",
 					message: "Cursor is in the future",
@@ -421,6 +440,35 @@ export class LabelerServer {
 				createdAt: new Date().toISOString(),
 			} satisfies ToolsOzoneModerationEmitEvent.Output,
 		);
+	};
+
+	/**
+	 * Handler for the health check endpoint.
+	 */
+	healthHandler: QueryHandler = async (_req, res) => {
+		const VERSION = "0.2.0";
+		return res.send({ version: VERSION });
+	};
+
+	/**
+	 * Catch-all handler for unknown XRPC methods.
+	 */
+	unknownMethodHandler: QueryHandler = async (_req, res) =>
+		res.status(501).send({ error: "MethodNotImplemented", message: "Method Not Implemented" });
+
+	/**
+	 * Default error handler.
+	 */
+	errorHandler: typeof this.app.errorHandler = async (err, _req, res) => {
+		if (err instanceof XRPCError) {
+			return res.status(err.status).send({ error: err.kind, message: err.description });
+		} else {
+			console.error(err);
+			return res.status(500).send({
+				error: "InternalServerError",
+				message: "An unknown error occurred",
+			});
+		}
 	};
 
 	/**
