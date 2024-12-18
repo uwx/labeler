@@ -176,6 +176,12 @@ export class LabelerServer {
 		});
 	}
 
+    private getOriginalUrl(req: HonoRequest) {
+        const { pathname, search } = new URL(req.url);
+    
+        return new URL(pathname + search, `${req.header('x-forwarded-proto')}://${req.header('x-forwarded-host')}`).toString();
+    }
+    
 	/**
 	 * Parse a user DID from an Authorization header JWT.
 	 * @param req The Express request object.
@@ -197,7 +203,7 @@ export class LabelerServer {
 			});
 		}
 
-		const nsid = (req.url || "").split("?")[0].replace("/xrpc/", "").replace(
+		const nsid = new URL(this.getOriginalUrl(req)).pathname.replace("/xrpc/", "").replace(
 			/\/$/,
 			"",
 		);
@@ -214,7 +220,6 @@ export class LabelerServer {
             onOpen: async (evt, ws) => {
                 // catch up:
                 if (cursor !== undefined) {
-
                     if (await this.db.isCursorInTheFuture(cursor)) {
                         this.logger.warn(`sending FutureCursor to ws`);
 
@@ -257,7 +262,7 @@ export class LabelerServer {
                 this.logger.error(evt, `ws error`);
             },
             onClose: (evt, ws) => {
-                this.logger.debug(evt, `ws closed!!!`);
+                this.logger.debug(evt, `ws closed!!! ${ws.url}`);
                 this.removeSubscription("com.atproto.label.subscribeLabels", ws);
             },
         } satisfies WSEvents;
@@ -365,7 +370,7 @@ export class LabelerServer {
 	 */
 	healthHandler = (c: Context) => {
 		const VERSION = "0.2.0";
-		return c.json({ version: VERSION });
+		return c.json({ version: VERSION, connections: this.connections.values().reduce((a, b) => a + b.size, 0), });
 	};
 
 	/**
@@ -395,9 +400,12 @@ export class LabelerServer {
 	 * @param ws The WebSocket connection to add.
 	 */
 	private addSubscription(nsid: string, ws: WSContext) {
-		const subs = this.connections.get(nsid) ?? new Set();
+		let subs = this.connections.get(nsid);
+        if (!subs) {
+            subs = new Set();
+            this.connections.set(nsid, subs);
+        }
 		subs.add(ws);
-		this.connections.set(nsid, subs);
 	}
 
 	/**
